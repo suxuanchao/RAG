@@ -83,7 +83,7 @@ const pollTaskStatus = async (fileId: string) => {
 }
 
 const goToSearch = () => {
-  router.push('/search')
+  router.push('/')
 }
 </script>
 
@@ -94,6 +94,18 @@ const goToSearch = () => {
         <h1 class="text-4xl font-bold text-center text-gray-800 mb-8">
           知识库增量更新
         </h1>
+        
+        <div class="max-w-2xl mx-auto mb-6">
+          <button
+            @click="goToSearch"
+            class="w-full flex justify-center items-center gap-2 py-3 px-4 border border-indigo-600 rounded-md shadow-sm text-sm font-medium text-indigo-600 bg-white hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+          >
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            </svg>
+            返回检索页面
+          </button>
+        </div>
         
         <div class="bg-white rounded-xl shadow-lg p-8">
           <div class="mb-6">
@@ -162,9 +174,12 @@ const goToSearch = () => {
           <div v-if="!isUploading && uploadStatus && !errorMessage" class="mt-6">
             <button
               @click="goToSearch"
-              class="w-full flex justify-center py-3 px-4 border border-indigo-600 rounded-md shadow-sm text-sm font-medium text-indigo-600 bg-white hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+              class="w-full flex justify-center items-center gap-2 py-3 px-4 border border-indigo-600 rounded-md shadow-sm text-sm font-medium text-indigo-600 bg-white hover:bg-indigo-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
             >
-              前往检索页面
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+              </svg>
+              返回检索页面
             </button>
           </div>
         </div>
