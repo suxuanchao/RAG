@@ -167,49 +167,82 @@ def _build_qdrant_filter(filter_dict: dict) -> Optional[Filter]:
 def stage1_parse_document(input_file: str, output_dir: str, file_id: str) -> Dict[str, Any]:
     """
     阶段 1: 使用 MinerU 解析文档
+
+    采用新版 API（magic-pdf 1.x / MinerU 2.x）：
+    PymuDocDataset + operators 流水线，OCR/文本模式由框架自动调度。
+    旧版 magic_pdf.pipe.UNIPipe 已被移除，不可用。
     """
     print(f"\n{'='*60}")
     print(f"阶段 1: 文档解析 (MinerU)")
     print(f"{'='*60}")
-    
+
     try:
+        from magic_pdf.data.dataset import PymuDocDataset
         from magic_pdf.data.data_reader_writer import FileBasedDataWriter
-        from magic_pdf.data.data_reader_writer import FileBasedDataReader
-        from magic_pdf.pipe.UNIPipe import UNIPipe
-        from magic_pdf.rw.DiskReaderWriter import DiskReaderWriter
-        
+        from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+        from magic_pdf.config.enums import SupportedPdfParseMethod
+        from magic_pdf.config.constants import MODEL_NAME
+
         input_path = Path(input_file)
         file_name = input_path.stem
-        
-        # 读取文件
-        reader = FileBasedDataReader("")
-        pdf_bytes = reader.read(input_file)
-        
-        # 创建临时目录
-        temp_dir = Path(output_dir) / "temp" / file_id
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 创建 writer
-        image_writer = DiskReaderWriter(str(temp_dir))
-        md_content_writer = DiskReaderWriter(str(temp_dir))
-        
-        # 构建 JIPipe 需要的数据
-        jso_useful_key = {
-            "_pdf_type": "",
-            "model_list": [],
-            "page_num": 0
-        }
-        
-        # 执行解析
-        pipe = UNIPipe(pdf_bytes, jso_useful_key, image_writer)
-        pipe.pipe_classify()
-        pipe.pipe_analyze()
-        pipe.pipe_parse()
-        
-        # 获取解析结果
-        md_content = pipe.pipe_mk_markdown(image_writer, drop_mode="none")
-        
+
+        if not input_path.exists():
+            raise FileNotFoundError(f"文件不存在：{input_file}")
+
+        # 读取 PDF 原始字节
+        with open(input_file, "rb") as f:
+            pdf_bytes = f.read()
+        if not pdf_bytes:
+            raise ValueError(f"PDF 文件为空：{input_file}")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 构建 Dataset
+        ds = PymuDocDataset(pdf_bytes)
+
+        # 自动判断解析方式（等价于官方 CLI 的 method='auto'）
+        pdf_type = ds.classify()
+        use_ocr = (pdf_type != SupportedPdfParseMethod.TXT)
+        print(f"  PDF 类型：{pdf_type}（{'OCR 模式' if use_ocr else '文本模式'}）")
+
+        # 准备图片输出目录（OCR/含图 PDF 会导出图片）
+        image_dir_name = f"{file_id}_images"
+        local_image_dir = Path(output_dir) / image_dir_name
+        os.makedirs(local_image_dir, exist_ok=True)
+        image_writer = FileBasedDataWriter(str(local_image_dir))
+
+        # 推理 + 解析流水线
+        # - layout_model=doclayout_yolo：默认 layoutlmv3 依赖 detectron2（Windows 极难装）
+        # - formula_enable=False：当前环境 transformers 版本与 UniMERNet 不兼容
+        infer_result = ds.apply(
+            doc_analyze,
+            ocr=use_ocr,
+            layout_model=MODEL_NAME.DocLayout_YOLO,
+            formula_enable=False,
+        )
+        if use_ocr:
+            pipe_result = infer_result.pipe_ocr_mode(image_writer, debug_mode=False)
+        else:
+            pipe_result = infer_result.pipe_txt_mode(image_writer, debug_mode=False)
+
+        # 直接获取解析结果（无需落盘中间文件）
+        md_content = pipe_result.get_markdown(image_dir_name) or ""
+        content_list = pipe_result.get_content_list(image_dir_name)
+        if isinstance(content_list, str):
+            content_list = json.loads(content_list)
+        if not isinstance(content_list, list):
+            content_list = []
+
+        # 真正无内容时按失败处理，避免空结果进入下游阶段
+        if not md_content.strip() and not content_list:
+            raise ValueError(
+                "未能从 PDF 中提取到任何文本内容。可能原因：1) PDF 为扫描版且 OCR 模型权重未就绪；"
+                "2) PDF 加密或损坏。请检查 MinerU 模型是否已下载。"
+            )
+
         # 构建输出 JSON
+        # content 直接保存 MinerU 原始 content_list（每项含 type/text/page_idx 等），
+        # 供 stage2 的清洗策略（FaultCaseStrategy/DeclarationStrategy）按其契约消费。
         output_data = {
             "metadata": {
                 "source_file": str(input_path.absolute()),
@@ -217,51 +250,34 @@ def stage1_parse_document(input_file: str, output_dir: str, file_id: str) -> Dic
                 "parse_time": datetime.now().isoformat(),
                 "parser": "mineru",
                 "file_name": file_name,
-                "file_size": input_path.stat().st_size
+                "file_size": input_path.stat().st_size,
+                "parse_method": "ocr" if use_ocr else "txt"
             },
-            "content": []
+            "markdown": md_content,
+            "content": content_list
         }
-        
-        # 解析 markdown 内容并结构化
-        if isinstance(md_content, list):
-            for page_idx, page_content in enumerate(md_content):
-                if page_content.strip():
-                    output_data["content"].append({
-                        "page_num": page_idx + 1,
-                        "type": "text",
-                        "content": page_content
-                    })
-        elif isinstance(md_content, str):
-            pages = md_content.split("\f")
-            for page_idx, page_content in enumerate(pages):
-                if page_content.strip():
-                    output_data["content"].append({
-                        "page_num": page_idx + 1,
-                        "type": "text",
-                        "content": page_content
-                    })
-        
+
         # 保存解析结果
         output_json_path = Path(output_dir) / f"{file_id}.json"
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
-        
+
         print(f"✓ 解析完成：{file_name}")
         print(f"  输出文件：{output_json_path}")
-        print(f"  页数：{len(output_data['content'])}")
-        
+        print(f"  内容块数：{len(output_data['content'])}")
+
         return {
             "status": "success",
             "output_file": str(output_json_path),
-            "pages": len(output_data['content']),
+            "pages": len(output_data["content"]),
             "message": "Parsing completed successfully"
         }
-        
+
     except Exception as e:
         error_msg = f"解析失败：{str(e)}"
         print(f"✗ {error_msg}")
         traceback.print_exc()
-        
+
         return {
             "status": "error",
             "message": error_msg
@@ -283,38 +299,59 @@ def stage2_clean_data(json_path: str, output_dir: str, file_id: str) -> Dict[str
         sys.path.insert(0, os.path.join(BASE_DIR, "src", "clean"))
         from faultCaseStrategy import FaultCaseStrategy
         from declarationStrategy import DeclarationStrategy
-        
-        # 加载原始数据
+
+        # 加载 stage1 产物：{metadata, markdown, content}
         with open(json_path, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
-        
-        # 展平数据结构
+
+        # 方案 A：从 content 字段取 MinerU 原始 content_list（策略契约要求的格式）
+        if isinstance(raw_data, dict):
+            blocks = raw_data.get("content", [])
+            file_name = raw_data.get("metadata", {}).get("file_name") or os.path.basename(json_path)
+        elif isinstance(raw_data, list):
+            # 兼容直接落盘的裸 content_list
+            blocks = raw_data
+            file_name = os.path.basename(json_path)
+        else:
+            raise ValueError(f"无法识别的 stage1 产物结构：{type(raw_data)}")
+
+        # 展平数据结构（兼容 1D / 2D 数组，与 clean.py 一致）
         all_blocks = []
-        if raw_data:
-            if isinstance(raw_data[0], dict):
-                all_blocks = raw_data
-            elif isinstance(raw_data[0], list):
-                for page_idx, page_blocks in enumerate(raw_data):
+        if blocks:
+            if isinstance(blocks[0], dict):
+                all_blocks = blocks
+            elif isinstance(blocks[0], list):
+                for page_idx, page_blocks in enumerate(blocks):
                     for block in page_blocks:
                         if "page_idx" not in block and "page_idx " not in block:
                             block["page_idx"] = page_idx
                         all_blocks.append(block)
-        
-        # 智能路由 - 默认使用 fault_case 策略
+
+        # 智能路由：按文件名嗅探文档类型，默认 fault_case
+        def detect_doc_type(name: str) -> str:
+            if "质量案例" in name or "案例" in name:
+                return "fault_case"
+            if "申报" in name or "报告" in name:
+                return "declaration"
+            return "fault_case"
+
         strategies = {
             "fault_case": FaultCaseStrategy(),
             "declaration": DeclarationStrategy()
         }
-        strategy = strategies.get("fault_case", strategies["fault_case"])
-        
+        doc_type = detect_doc_type(file_name)
+        strategy = strategies.get(doc_type, strategies["fault_case"])
+        print(f"  文档类型：{doc_type}（策略：{strategy.__class__.__name__}）")
+
         # 执行清洗
-        file_name = os.path.basename(json_path)
-        raw_docs = strategy.parse(all_blocks, file_name, "default")
+        raw_docs = strategy.parse(all_blocks, file_name, doc_type)
         
-        # 生成 block_id
+        # 生成 block_id，并写入 metadata 以便沿 stage3 -> stage4 流转（用于去重/增量更新）
         for doc in raw_docs:
             content_hash = hashlib.md5(doc["content"].encode('utf-8')).hexdigest()[:8]
-            doc["block_id"] = f"{file_id}_{content_hash}"
+            block_id = f"{file_id}_{content_hash}"
+            doc["block_id"] = block_id
+            doc["metadata"]["block_id"] = block_id
         
         # 保存清洗结果
         os.makedirs(output_dir, exist_ok=True)
@@ -430,6 +467,8 @@ def stage4_embed_and_store(json_path: str, client: QdrantClient,
     print(f"{'='*60}")
     
     try:
+        from langchain_core.documents import Document
+
         # 加载切块数据
         with open(json_path, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)

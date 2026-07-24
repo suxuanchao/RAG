@@ -5,6 +5,52 @@ import os
 import hashlib
 from faultCaseStrategy import FaultCaseStrategy
 from declarationStrategy import DeclarationStrategy
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# ================= 5. 阶段三：智能切片模块 (Core Chunking) =================
+def chunk_documents(raw_docs: List[Dict[str, Any]], chunk_size: int = 800, chunk_overlap: int = 50) -> List[Document]:
+    """
+    对阶段二产出的 raw_docs 进行 LangChain 智能切片
+    """
+    final_docs = []
+    # 使用 RecursiveCharacterTextSplitter 保证按中文标点语义切分
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", "。", "！", "？", ".", " ", ""]
+    )
+
+    for item in raw_docs:
+        metadata = item["metadata"]
+        content = item["content"]
+        chunk_type = metadata.get("chunk_type", "text")
+        
+        if chunk_type == "table":
+            # 【核心规则 1】：表格绝对不被切碎，整体作为一个 Document
+            final_docs.append(Document(page_content=content, metadata=metadata))
+        else:
+            # 【核心规则 2】：正文过长时进行切片，并复制 metadata 给每一个子块
+            splits = text_splitter.split_text(content)
+            for split in splits:
+                final_docs.append(Document(page_content=split, metadata=metadata.copy()))
+
+    return final_docs
+
+def save_chunks_to_disk(docs: List[Document], output_dir: str, chunk_doc_name: str):
+    """将 LangChain Document 列表落盘为 JSON 文件"""
+    os.makedirs(output_dir, exist_ok=True)
+            
+    # 构造输出路径
+    output_path = os.path.join(output_dir, f"{chunk_doc_name}_chunk.json")
+    # 将 Document 对象转换为可序列化的字典
+    serializable_docs = [
+        {"page_content": doc.page_content, "metadata": doc.metadata}
+        for doc in docs
+    ]
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(serializable_docs, f, ensure_ascii=False, indent=2)
+    print(f"💾 [阶段三] 切片数据已落盘至: {output_path}")
 
 # ================= 5. 智能路由与主控 Pipeline =================
 class MinerU_RAG_Pipeline:
@@ -110,6 +156,13 @@ class MinerU_RAG_Pipeline:
         
         # 4. 存储中间清洗结果
         self.save_clean_output(raw_docs, OUTPUT_DIR, clean_doc_name)
+        
+         # 阶段三：切片
+        final_docs = chunk_documents(raw_docs, chunk_size=500, chunk_overlap=50)
+        
+        # 切片落盘
+        CHUNK_DIR  = "..\\..\\data\\middle\\chunk_output"
+        save_chunks_to_disk(final_docs, CHUNK_DIR, clean_doc_name)
     
 # ================= 批量处理与测试运行模块 =================
 def process_directory(pipeLine: MinerU_RAG_Pipeline, input_dir: str, output_dir: str, file_pattern: str = "*content_list*.json"):
@@ -120,29 +173,26 @@ def process_directory(pipeLine: MinerU_RAG_Pipeline, input_dir: str, output_dir:
     json_files = glob.glob(search_pattern, recursive=True)
     
     if not json_files:
-        print(f"未在 {input_dir} 下找到任何匹配 {file_pattern} 的文件。")
+        print(f"⚠️ 未在 {input_dir} 下找到任何匹配 {file_pattern} 的文件。")
         return
 
-    print(f"找到 {len(json_files)} 个文档，开始处理...\n")
+    print(f"🔍 找到 {len(json_files)} 个文档，开始处理...\n")
     
     for f_path in json_files:
         if os.path.exists(f_path):
-            print(f"\n正在处理: {os.path.basename(f_path)}")
+            print(f"\n🚀 正在处理: {os.path.basename(f_path)}")
             try:
                 pipeLine.process(f_path)
                     
             except Exception as e:
-                print(f"处理文件 {f_path} 时出错: {e}")
+                print(f"❌ 处理文件 {f_path} 时出错: {e}")
         else:
-            print(f"文件不存在: {f_path}")
+            print(f"⚠️ 文件不存在: {f_path}")
     
 # ================= 测试运行 =================
 if __name__ == "__main__":
     
-    # INPUT_DIR = "..\\..\\data\\middle\\mineru_output"
-
-    INPUT_DIR = "D:\\Tools\\MinerU_1.3.12\\MinerU\\output"
-
+    INPUT_DIR = "..\\..\\data\\middle\\mineru_output"
     OUTPUT_DIR = "..\\..\\data\\middle\\cleaned_output"
     
     pipeline = MinerU_RAG_Pipeline()
